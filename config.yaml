@@ -1,0 +1,50 @@
+# Configuration preprocessing
+preprocess:
+  source: dataset  # Chemin du dataset source
+  output: dataset/preprocessed/train  # Chemin de sortie
+  sigma: 3.0  # Ecart-type du gaussian pour les heatmaps
+  force: false  # Ecraser le dossier de sortie existant
+  workers: 16  # Nombre de threads paralleles
+
+# Configuration entrainement
+train:
+  gpus: 1  # Nombre de GPUs: 1=single, 8=8 GPUs DDP
+  data: dataset/preprocessed/train  # Chemin du dataset d'entrainement
+  resume: null  # Chemin pour reprendre l'entrainement (ex: outputs/exp_20241219_140000)
+  split: 0.8  # Ratio train/validation
+  seed: 24  # Graine aleatoire
+  batch: 4  # Taille du batch
+  epochs: 30  # Nombre d'epoques
+  workers: 8  # Nombre de workers pour le DataLoader
+  device: cuda  # Device: auto/cpu/cuda/mps
+  optimizer: Adadelta  # Optimiseur: Adadelta/Adam/AdamW/SGD
+  lr: null  # Learning rate (null = valeur par defaut de l'optimiseur)
+  wd: 0  # Weight decay
+  scheduler: ReduceLROnPlateau  # Scheduler: ReduceLROnPlateau/None
+  factor: 0.5  # Facteur de reduction du LR
+  patience: 3  # Patience avant reduction du LR
+  min_lr: 0.000001  # Learning rate minimum
+  out: outputs  # Dossier de sortie
+  name: exp  # Nom de l'experience
+  dropout: 0.2  # Taux de dropout
+
+# Configuration test
+test:
+  model: best_model.pth  # Chemin du checkpoint
+  data: dataset/test  # Chemin du dataset de test
+  batch: 4  # Taille du batch
+  threshold: 0.5  # Seuil de detection
+  tolerance: 4  # Tolerance de distance (pixels)
+  device: auto  # Device: auto/cpu/cuda/mps
+  out: test_results  # Dossier de sortie
+  report: detailed  # Niveau de rapport: summary/detailed
+  save_predictions: false  # Sauvegarder les coordonnees predites
+
+# Configuration prediction video
+predict:
+  model: outputs/exp_20251220_065107/checkpoints/emergency_epoch_4_20251220_070354.pth  # Chemin du checkpoint
+  input: dataset/predict/short.mp4  # Chemin video d'entree
+  output: dataset/predict/predicted_video.mp4  # Chemin video de sortie
+  threshold: 0.5  # Seuil de detection
+  dot_size: 5  # Taille du marqueur (pixels)
+  batch_size: 8  # Taille du batch d'inference (plus grand = plus rapide mais plus de VRAM)

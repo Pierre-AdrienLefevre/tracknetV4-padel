@@ -207,8 +207,8 @@ uv run python preprocessing/convert_padeltracker.py \
 # Configurer config.yaml puis:
 uv run python train.py --config config.yaml
 
-# TensorBoard pour monitoring:
-tensorboard --logdir outputs/
+# Monitoring sur Weights & Biases (wandb.ai)
+# L'URL du run s'affiche au lancement
 ```
 
 ### Étape 6: Inférence

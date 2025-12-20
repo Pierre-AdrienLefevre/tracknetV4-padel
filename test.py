@@ -12,9 +12,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import wandb
 import yaml
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from model.tracknet_v4 import TrackNet
@@ -25,7 +25,12 @@ GROUND_TRUTH_THRESHOLD = 0.1
 
 def load_config(config_path):
     with open(config_path) as f:
-        return yaml.safe_load(f)['test']
+        full_cfg = yaml.safe_load(f)
+    test_cfg = full_cfg['test']
+    wandb_cfg = full_cfg.get('wandb', {})
+    test_cfg['wandb_project'] = wandb_cfg.get('project', 'tracknet')
+    test_cfg['wandb_entity'] = wandb_cfg.get('entity')
+    return test_cfg
 
 
 class TrackNetTester:
@@ -50,7 +55,14 @@ class TrackNetTester:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.save_dir = Path(self.cfg['out']) / f"test_{timestamp}"
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=str(self.save_dir / "tensorboard"))
+        wandb.init(
+            project=self.cfg.get('wandb_project', 'tracknet'),
+            entity=self.cfg.get('wandb_entity'),
+            name=f"test_{timestamp}",
+            config=self.cfg,
+            job_type='test',
+            dir=str(self.save_dir)
+        )
 
     def _load_model(self):
         self.model = TrackNet().to(self.device)
@@ -146,23 +158,27 @@ class TrackNetTester:
         detection_rate = self.results['detected_frames'] / self.results['total_frames'] if self.results['total_frames'] > 0 else 0
         return {'accuracy': accuracy, 'precision': precision, 'recall': recall, 'f1_score': f1_score, 'detection_rate': detection_rate}
 
-    def _log_metrics(self, metrics):
-        self.writer.add_scalar('metrics/accuracy', metrics['accuracy'], 0)
-        self.writer.add_scalar('metrics/precision', metrics['precision'], 0)
-        self.writer.add_scalar('metrics/recall', metrics['recall'], 0)
-        self.writer.add_scalar('metrics/f1_score', metrics['f1_score'], 0)
-        self.writer.add_scalar('metrics/detection_rate', metrics['detection_rate'], 0)
-        self.writer.add_scalar('confusion/tp', self.results['tp'], 0)
-        self.writer.add_scalar('confusion/tn', self.results['tn'], 0)
-        self.writer.add_scalar('confusion/fp1', self.results['fp1'], 0)
-        self.writer.add_scalar('confusion/fp2', self.results['fp2'], 0)
-        self.writer.add_scalar('confusion/fn', self.results['fn'], 0)
+    def _log_metrics(self, metrics, test_time):
+        wandb.log({
+            'accuracy': metrics['accuracy'],
+            'precision': metrics['precision'],
+            'recall': metrics['recall'],
+            'f1_score': metrics['f1_score'],
+            'detection_rate': metrics['detection_rate'],
+            'tp': self.results['tp'],
+            'tn': self.results['tn'],
+            'fp1': self.results['fp1'],
+            'fp2': self.results['fp2'],
+            'fn': self.results['fn'],
+            'test_time': test_time,
+            'fps': self.results['total_frames'] / test_time if test_time > 0 else 0
+        })
 
     def run_test(self):
         self._setup_data()
-        
-        print(f"TensorBoard: tensorboard --logdir {self.save_dir / 'tensorboard'}")
-        
+
+        print(f"W&B: {wandb.run.url}")
+
         start_time = time.time()
         batch_start_idx = 0
         with torch.no_grad():
@@ -175,10 +191,8 @@ class TrackNetTester:
         self._process_center_frame_predictions()
         test_time = time.time() - start_time
         metrics = self._calculate_metrics()
-        self._log_metrics(metrics)
-        self.writer.add_scalar('test/time', test_time, 0)
-        self.writer.add_scalar('test/fps', self.results['total_frames'] / test_time, 0)
-        self.writer.close()
+        self._log_metrics(metrics, test_time)
+        wandb.finish()
         return metrics
 
 

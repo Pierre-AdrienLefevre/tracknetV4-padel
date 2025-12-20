@@ -15,12 +15,12 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import wandb
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from model.loss import WeightedBinaryCrossEntropy
@@ -95,7 +95,14 @@ class Trainer:
             self.step = self.checkpoint.get('step', 0)
             self.best_loss = self.checkpoint.get('best_loss', self.checkpoint.get('val_loss', float('inf')))
             if self.is_main:
-                self.writer = SummaryWriter(log_dir=str(self.save_dir / "tensorboard"))
+                wandb.init(
+                    project=self.cfg.get('wandb_project', 'tracknet'),
+                    entity=self.cfg.get('wandb_entity'),
+                    name=self.save_dir.name,
+                    config=self.cfg,
+                    resume='allow',
+                    dir=str(self.save_dir)
+                )
                 print(f"Resuming from epoch {self.start_epoch}, step {self.step}")
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -103,7 +110,13 @@ class Trainer:
             if self.is_main:
                 self.save_dir.mkdir(parents=True, exist_ok=True)
                 (self.save_dir / "checkpoints").mkdir(exist_ok=True)
-                self.writer = SummaryWriter(log_dir=str(self.save_dir / "tensorboard"))
+                wandb.init(
+                    project=self.cfg.get('wandb_project', 'tracknet'),
+                    entity=self.cfg.get('wandb_entity'),
+                    name=self.save_dir.name,
+                    config=self.cfg,
+                    dir=str(self.save_dir)
+                )
         if self.world_size > 1:
             dist.barrier()
 
@@ -173,8 +186,7 @@ class Trainer:
             )
 
         if self.is_main and not self.checkpoint:
-            self.writer.add_text('dataset/train_size', str(len(train_ds)))
-            self.writer.add_text('dataset/val_size', str(len(val_ds)))
+            wandb.config.update({'train_size': len(train_ds), 'val_size': len(val_ds)})
 
     def _create_optimizer(self):
         lr = self._get_lr()
@@ -265,7 +277,7 @@ class Trainer:
         self.setup_model()
 
         if self.is_main:
-            print(f"TensorBoard: tensorboard --logdir {self.save_dir / 'tensorboard'}")
+            print(f"W&B: {wandb.run.url}")
             if self.world_size > 1:
                 print(f"Training with {self.world_size} GPUs")
 
@@ -285,7 +297,7 @@ class Trainer:
                     val_loss = self.validate()
                     self.save_checkpoint(epoch, total_loss / (batch_idx + 1), val_loss, True)
                     if self.is_main:
-                        self.writer.close()
+                        wandb.finish()
                     return
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 self.optimizer.zero_grad()
@@ -298,24 +310,27 @@ class Trainer:
                 self.step += 1
                 if self.is_main:
                     current_lr = self._calculate_effective_lr()
-                    self.writer.add_scalar('batch/loss', batch_loss, self.step)
-                    self.writer.add_scalar('batch/lr', current_lr, self.step)
+                    wandb.log({'batch/loss': batch_loss, 'batch/lr': current_lr}, step=self.step)
                 pbar.set_postfix({'loss': f'{batch_loss:.6f}'})
             pbar.close()
             train_loss = total_loss / len(self.train_loader)
             val_loss = self.validate()
             elapsed = time.time() - start_time
             if self.is_main:
-                self.writer.add_scalars('epoch/loss', {'train': train_loss, 'val': val_loss}, epoch + 1)
-                self.writer.add_scalar('epoch/lr', self.optimizer.param_groups[0]['lr'], epoch + 1)
-                self.writer.add_scalar('epoch/time', elapsed, epoch + 1)
+                wandb.log({
+                    'epoch': epoch + 1,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'lr': self.optimizer.param_groups[0]['lr'],
+                    'epoch_time': elapsed
+                }, step=self.step)
             if self.scheduler:
                 self.scheduler.step(val_loss)
             self.save_checkpoint(epoch, train_loss, val_loss)
             if self.world_size > 1:
                 dist.barrier()
         if self.is_main:
-            self.writer.close()
+            wandb.finish()
 
 
 def main():
@@ -327,6 +342,9 @@ def main():
         full_cfg = yaml.safe_load(f)
 
     train_cfg = full_cfg['train']
+    wandb_cfg = full_cfg.get('wandb', {})
+    train_cfg['wandb_project'] = wandb_cfg.get('project', 'tracknet')
+    train_cfg['wandb_entity'] = wandb_cfg.get('entity')
     gpus = train_cfg.get('gpus', 1)
 
     if gpus > 1 and 'RANK' not in os.environ:

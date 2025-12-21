@@ -24,7 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from model.loss import WeightedBinaryCrossEntropy
-from model.tracknet_v2 import TrackNet
+from model.tracknet_v4 import TrackNet
 from preprocessing.tracknet_dataset import FrameHeatmapDataset
 
 

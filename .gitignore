@@ -179,3 +179,4 @@ weights/
 *.pth
 
 uv.lock
+predictions/

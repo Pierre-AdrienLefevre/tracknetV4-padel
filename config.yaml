@@ -20,7 +20,7 @@ train:
   seed: 24  # Graine aleatoire
   batch: 4  # Taille du batch
   epochs: 30  # Nombre d'epoques
-  workers: 8  # Nombre de workers pour le DataLoader
+  workers: 4  # Nombre de workers pour le DataLoader
   device: auto  # Device: auto/cpu/cuda/mps
   optimizer: Adadelta  # Optimiseur: Adadelta/Adam/AdamW/SGD
   lr: null  # Learning rate (null = valeur par defaut de l'optimiseur)

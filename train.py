@@ -201,7 +201,7 @@ class Trainer:
                     type="dataset",
                     description=f"TrackNet dataset with {len(dataset)} samples"
                 )
-                dataset_artifact.add_reference(f"file://{Path(self.cfg['data']).resolve()}")
+                dataset_artifact.add_reference(Path(self.cfg['data']).resolve().as_uri())
                 wandb.log_artifact(dataset_artifact)
 
     def _create_optimizer(self):

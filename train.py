@@ -23,9 +23,12 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+import numpy as np
+
 from model.loss import WeightedBinaryCrossEntropy
 from model.tracknet_v4 import TrackNet
 from preprocessing.tracknet_dataset import FrameHeatmapDataset
+from utils.metrics import TrackNetMetrics
 
 
 def load_config(config_path):
@@ -95,12 +98,15 @@ class Trainer:
             self.step = self.checkpoint.get('step', 0)
             self.best_loss = self.checkpoint.get('best_loss', self.checkpoint.get('val_loss', float('inf')))
             if self.is_main:
+                # Resume W&B run with saved run_id if available
+                wandb_run_id = self.checkpoint.get('wandb_run_id')
                 wandb.init(
                     project=self.cfg.get('wandb_project', 'tracknet'),
                     entity=self.cfg.get('wandb_entity'),
                     name=self.save_dir.name,
                     config=self.cfg,
-                    resume='allow',
+                    id=wandb_run_id,
+                    resume='must' if wandb_run_id else 'allow',
                     dir=str(self.save_dir)
                 )
                 print(f"Resuming from epoch {self.start_epoch}, step {self.step}")
@@ -188,6 +194,16 @@ class Trainer:
         if self.is_main and not self.checkpoint:
             wandb.config.update({'train_size': len(train_ds), 'val_size': len(val_ds)})
 
+            # Log dataset artifact
+            if self.cfg.get('log_artifacts', True):
+                dataset_artifact = wandb.Artifact(
+                    name="padel-dataset",
+                    type="dataset",
+                    description=f"TrackNet dataset with {len(dataset)} samples"
+                )
+                dataset_artifact.add_reference(f"file://{Path(self.cfg['data']).resolve()}")
+                wandb.log_artifact(dataset_artifact)
+
     def _create_optimizer(self):
         lr = self._get_lr()
         wd = self.cfg['wd']
@@ -225,6 +241,11 @@ class Trainer:
             if self.scheduler and 'scheduler_state_dict' in self.checkpoint:
                 self.scheduler.load_state_dict(self.checkpoint['scheduler_state_dict'])
 
+        # Watch model gradients and parameters
+        if self.is_main and self.cfg.get('watch_model', True):
+            watch_freq = self.cfg.get('watch_freq', 100)
+            wandb.watch(self.model, self.criterion, log="all", log_freq=watch_freq)
+
     def save_checkpoint(self, epoch, train_loss, val_loss, is_emergency=False):
         if not self.is_main:
             return None, False
@@ -241,7 +262,8 @@ class Trainer:
             'learning_rate': self.optimizer.param_groups[0]['lr'],
             'is_emergency': is_emergency,
             'step': self.step,
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'wandb_run_id': wandb.run.id if wandb.run else None
         }
         prefix = "emergency_" if is_emergency else "checkpoint_"
         filename = f"{prefix}epoch_{epoch + 1}_{timestamp}.pth"
@@ -250,27 +272,115 @@ class Trainer:
         if not is_emergency and val_loss < self.best_loss:
             self.best_loss = val_loss
             checkpoint['best_loss'] = self.best_loss
-            torch.save(checkpoint, self.save_dir / "checkpoints" / "best_model.pth")
+            best_model_path = self.save_dir / "checkpoints" / "best_model.pth"
+            torch.save(checkpoint, best_model_path)
+
+            # Upload best model to W&B
+            if self.cfg.get('save_best_model', True):
+                artifact = wandb.Artifact(
+                    name=f"best-model-{self.save_dir.name}",
+                    type="model",
+                    description=f"Best model at epoch {epoch+1} with val_loss {val_loss:.6f}"
+                )
+                artifact.add_file(str(best_model_path))
+                wandb.log_artifact(artifact)
+
             return filepath, True
         return filepath, False
 
-    def validate(self):
+    def validate(self, epoch=None):
         self.model.eval()
         total_loss = 0.0
+        metrics = TrackNetMetrics(
+            threshold=self.cfg.get('threshold', 0.5),
+            tolerance=self.cfg.get('tolerance', 4)
+        )
+        sample_images = []
+        log_images = self.cfg.get('log_images', True)
+        images_count = self.cfg.get('log_images_count', 8)
+
         with torch.no_grad():
-            for inputs, targets in tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.is_main):
+            for batch_idx, (inputs, targets) in enumerate(tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.is_main)):
                 if self.interrupted:
                     break
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
                 total_loss += loss.item()
+
+                # Calculate metrics
+                if self.cfg.get('compute_metrics', True):
+                    metrics.update(outputs, targets)
+
+                # Collect sample images for logging
+                if log_images and len(sample_images) < images_count and self.is_main:
+                    sample_images.append((inputs[0].cpu(), outputs[0].cpu(), targets[0].cpu()))
+
         avg_loss = total_loss / len(self.val_loader)
         if self.world_size > 1:
             loss_tensor = torch.tensor(avg_loss, device=self.device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             avg_loss = loss_tensor.item()
+
+        # Log metrics and images
+        if self.is_main and self.cfg.get('compute_metrics', True):
+            computed_metrics = metrics.compute()
+            wandb.log({
+                'val/accuracy': computed_metrics['accuracy'],
+                'val/precision': computed_metrics['precision'],
+                'val/recall': computed_metrics['recall'],
+                'val/f1_score': computed_metrics['f1_score'],
+                'val/detection_rate': computed_metrics['detection_rate'],
+                'val/tp': computed_metrics['tp'],
+                'val/tn': computed_metrics['tn'],
+                'val/fp': computed_metrics['fp1'] + computed_metrics['fp2'],
+                'val/fn': computed_metrics['fn']
+            }, step=self.step)
+
+        # Log sample images
+        if self.is_main and log_images and sample_images:
+            self._log_sample_predictions(sample_images, epoch)
+
         return avg_loss
+
+    def _log_sample_predictions(self, samples, epoch=None):
+        """Log sample predictions to W&B."""
+        images = []
+        for idx, (input_tensor, pred_tensor, gt_tensor) in enumerate(samples):
+            # Extract center frame (index 1) from the 3-frame input
+            # Input is [9, H, W] = 3 RGB frames concatenated
+            frame = input_tensor[3:6].permute(1, 2, 0).numpy()  # Center frame RGB
+            frame = (frame * 255).astype(np.uint8)
+
+            # Prediction and GT heatmaps (center frame)
+            pred_heatmap = pred_tensor[1].numpy()
+            gt_heatmap = gt_tensor[1].numpy()
+
+            # Create overlay
+            pred_overlay = self._create_overlay(frame, pred_heatmap, color=(255, 0, 0))  # Red
+            gt_overlay = self._create_overlay(frame, gt_heatmap, color=(0, 255, 0))  # Green
+
+            images.append(wandb.Image(frame, caption=f"Sample {idx+1}: Input"))
+            images.append(wandb.Image(pred_overlay, caption=f"Sample {idx+1}: Prediction"))
+            images.append(wandb.Image(gt_overlay, caption=f"Sample {idx+1}: Ground Truth"))
+
+        caption = f"Epoch {epoch+1}" if epoch is not None else "Validation"
+        wandb.log({f"predictions/{caption}": images}, step=self.step)
+
+    def _create_overlay(self, frame, heatmap, color=(255, 0, 0), alpha=0.5):
+        """Create overlay of heatmap on frame."""
+        overlay = frame.copy()
+        heatmap_normalized = (heatmap * 255).astype(np.uint8)
+
+        # Create colored heatmap
+        colored_heatmap = np.zeros_like(overlay)
+        for i, c in enumerate(color):
+            colored_heatmap[:, :, i] = (heatmap_normalized * c / 255).astype(np.uint8)
+
+        # Blend
+        mask = heatmap > 0.1
+        overlay[mask] = (overlay[mask] * (1 - alpha) + colored_heatmap[mask] * alpha).astype(np.uint8)
+        return overlay
 
     def train(self):
         self.setup_data()
@@ -294,9 +404,15 @@ class Trainer:
             for batch_idx, (inputs, targets) in enumerate(pbar):
                 if self.interrupted:
                     pbar.close()
-                    val_loss = self.validate()
+                    val_loss = self.validate(epoch)
                     self.save_checkpoint(epoch, total_loss / (batch_idx + 1), val_loss, True)
                     if self.is_main:
+                        if self.cfg.get('alerts', True):
+                            wandb.alert(
+                                title="Training Interrupted",
+                                text=f"Stopped at epoch {epoch+1}. Last val_loss: {val_loss:.6f}",
+                                level=wandb.AlertLevel.WARN
+                            )
                         wandb.finish()
                     return
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
@@ -314,7 +430,7 @@ class Trainer:
                 pbar.set_postfix({'loss': f'{batch_loss:.6f}'})
             pbar.close()
             train_loss = total_loss / len(self.train_loader)
-            val_loss = self.validate()
+            val_loss = self.validate(epoch)
             elapsed = time.time() - start_time
             if self.is_main:
                 wandb.log({
@@ -326,10 +442,24 @@ class Trainer:
                 }, step=self.step)
             if self.scheduler:
                 self.scheduler.step(val_loss)
-            self.save_checkpoint(epoch, train_loss, val_loss)
+            _, is_best = self.save_checkpoint(epoch, train_loss, val_loss)
+            if is_best and self.is_main and self.cfg.get('alerts', True):
+                wandb.alert(
+                    title="New Best Model",
+                    text=f"Epoch {epoch+1}: val_loss improved to {val_loss:.6f}",
+                    level=wandb.AlertLevel.INFO
+                )
             if self.world_size > 1:
                 dist.barrier()
+
+        # Training complete alert
         if self.is_main:
+            if self.cfg.get('alerts', True):
+                wandb.alert(
+                    title="Training Complete",
+                    text=f"Finished {self.cfg['epochs']} epochs. Best val_loss: {self.best_loss:.6f}",
+                    level=wandb.AlertLevel.INFO
+                )
             wandb.finish()
 
 
@@ -345,6 +475,15 @@ def main():
     wandb_cfg = full_cfg.get('wandb', {})
     train_cfg['wandb_project'] = wandb_cfg.get('project', 'tracknet')
     train_cfg['wandb_entity'] = wandb_cfg.get('entity')
+    # W&B options
+    train_cfg['log_images'] = wandb_cfg.get('log_images', True)
+    train_cfg['log_images_count'] = wandb_cfg.get('log_images_count', 8)
+    train_cfg['save_best_model'] = wandb_cfg.get('save_best_model', True)
+    train_cfg['watch_model'] = wandb_cfg.get('watch_model', True)
+    train_cfg['watch_freq'] = wandb_cfg.get('watch_freq', 100)
+    train_cfg['alerts'] = wandb_cfg.get('alerts', True)
+    train_cfg['compute_metrics'] = wandb_cfg.get('compute_metrics', True)
+    train_cfg['log_artifacts'] = wandb_cfg.get('log_artifacts', True)
     gpus = train_cfg.get('gpus', 1)
 
     if gpus > 1 and 'RANK' not in os.environ:

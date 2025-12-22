@@ -2,6 +2,15 @@
 wandb:
   project: tracknet-padel  # Nom du projet W&B
   entity: null  # Team/username W&B (null = compte par defaut)
+  # Logging options
+  log_images: true  # Logger les images (predictions vs ground truth)
+  log_images_count: 8  # Nombre d'images par epoch
+  save_best_model: true  # Sauvegarder le meilleur modele sur W&B
+  watch_model: true  # Logger les gradients et poids du modele
+  watch_freq: 100  # Frequence de log des gradients (batches)
+  alerts: true  # Envoyer des alertes (fin training, nouveau best model, interruption)
+  compute_metrics: true  # Calculer accuracy, F1, precision, recall
+  log_artifacts: true  # Logger les artifacts (dataset reference)
 
 # Configuration preprocessing
 preprocess:
@@ -15,7 +24,7 @@ preprocess:
 train:
   gpus: 1  # Nombre de GPUs: 1=single, 8=8 GPUs DDP
   data: dataset/preprocessed/train  # Chemin du dataset d'entrainement
-  resume: null  # Chemin pour reprendre l'entrainement (ex: outputs/exp_20241219_140000)
+  resume: outputs/exp_20251221_113721  # Chemin pour reprendre l'entrainement (ex: outputs/exp_20241219_140000)
   split: 0.8  # Ratio train/validation
   seed: 24  # Graine aleatoire
   batch: 4  # Taille du batch

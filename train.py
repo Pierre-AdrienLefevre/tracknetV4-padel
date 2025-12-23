@@ -18,6 +18,9 @@ import torch.distributed as dist
 import wandb
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Optimisation: accélère les convolutions pour des tailles d'input fixes
+torch.backends.cudnn.benchmark = True
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
@@ -65,6 +68,10 @@ class Trainer:
         self.device = self._get_device()
         self.step = 0
         self.checkpoint = None
+
+        # AMP (Automatic Mixed Precision) - seulement pour CUDA
+        self.use_amp = self.device.type == 'cuda'
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
         self._setup_dirs()
         signal.signal(signal.SIGINT, self._interrupt)
         signal.signal(signal.SIGTERM, self._interrupt)
@@ -168,27 +175,32 @@ class Trainer:
         train_size = int(self.cfg['split'] * len(dataset))
         train_ds, val_ds = random_split(dataset, [train_size, len(dataset) - train_size])
 
+        num_workers = self.cfg['workers']
+        persistent = num_workers > 0
+
         if self.world_size > 1:
             self.train_sampler = DistributedSampler(train_ds, shuffle=True)
             self.val_sampler = DistributedSampler(val_ds, shuffle=False)
             self.train_loader = DataLoader(
                 train_ds, batch_size=self.cfg['batch'], sampler=self.train_sampler,
-                num_workers=self.cfg['workers'], pin_memory=True
+                num_workers=num_workers, pin_memory=True, persistent_workers=persistent
             )
             self.val_loader = DataLoader(
                 val_ds, batch_size=self.cfg['batch'], sampler=self.val_sampler,
-                num_workers=self.cfg['workers'], pin_memory=True
+                num_workers=num_workers, pin_memory=True, persistent_workers=persistent
             )
         else:
             self.train_sampler = None
             self.val_sampler = None
             self.train_loader = DataLoader(
                 train_ds, batch_size=self.cfg['batch'], shuffle=True,
-                num_workers=self.cfg['workers'], pin_memory=self.device.type == 'cuda'
+                num_workers=num_workers, pin_memory=self.device.type == 'cuda',
+                persistent_workers=persistent
             )
             self.val_loader = DataLoader(
                 val_ds, batch_size=self.cfg['batch'], shuffle=False,
-                num_workers=self.cfg['workers'], pin_memory=self.device.type == 'cuda'
+                num_workers=num_workers, pin_memory=self.device.type == 'cuda',
+                persistent_workers=persistent
             )
 
         if self.is_main and not self.checkpoint:
@@ -240,6 +252,8 @@ class Trainer:
                 self.optimizer.load_state_dict(self.checkpoint['optimizer_state_dict'])
             if self.scheduler and 'scheduler_state_dict' in self.checkpoint:
                 self.scheduler.load_state_dict(self.checkpoint['scheduler_state_dict'])
+            if self.scaler and 'scaler_state_dict' in self.checkpoint and self.checkpoint['scaler_state_dict']:
+                self.scaler.load_state_dict(self.checkpoint['scaler_state_dict'])
 
         # Watch model gradients and parameters
         if self.is_main and self.cfg.get('watch_model', True):
@@ -256,6 +270,7 @@ class Trainer:
             'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
             'train_loss': train_loss,
             'val_loss': val_loss,
             'best_loss': self.best_loss,
@@ -304,8 +319,15 @@ class Trainer:
                 if self.interrupted:
                     break
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
+
+                if self.use_amp:
+                    with torch.amp.autocast('cuda'):
+                        outputs = self.model(inputs)
+                        loss = self.criterion(outputs, targets)
+                else:
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, targets)
+
                 total_loss += loss.item()
 
                 # Calculate metrics
@@ -416,11 +438,21 @@ class Trainer:
                         wandb.finish()
                     return
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                self.optimizer.zero_grad()
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
-                loss.backward()
-                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
+                if self.use_amp:
+                    with torch.amp.autocast('cuda'):
+                        outputs = self.model(inputs)
+                        loss = self.criterion(outputs, targets)
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, targets)
+                    loss.backward()
+                    self.optimizer.step()
+
                 batch_loss = loss.item()
                 total_loss += batch_loss
                 self.step += 1

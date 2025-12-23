@@ -269,6 +269,61 @@ uv run python predict/streem_video_predict.py \
 
 4. **GPU recommandé** - L'entraînement sur 100k frames nécessite un bon GPU (au moins 8GB VRAM)
 
+5. **⚠️ IMPORTANT: Problèmes de synchronisation vidéo/annotations dans PadelTracker100**
+
+   ### Le problème
+
+   Les annotations COCO du dataset PadelTracker100 ont été créées sur des **frames extraites** de la vidéo, mais ces extractions ne correspondent pas exactement aux frames de la vidéo MP4 fournie.
+
+   **Pour le match masculin**, la vidéo MP4 contient des **segments de replay/changement de caméra** qui n'existaient pas dans les frames utilisées pour l'annotation. Résultat: après chaque replay, les annotations sont **décalées** par rapport à la vidéo.
+
+   Exemple concret:
+   ```
+   Vidéo MP4:        [frame 0-324] [REPLAY 325-389] [frame 390...]
+   Annotations COCO: [image_id 1-325]               [image_id 326...]
+   ```
+
+   Si on utilise naïvement `image_id = frame_idx + 1`, après le replay on associe:
+   - frame 390 de la vidéo → image_id 391 des annotations ❌
+   - Alors qu'il faudrait: frame 390 → image_id 326 ✓
+
+   **Conséquence sans correction**: Le modèle apprend que la balle est à une position X alors qu'elle est ailleurs → apprentissage complètement faux!
+
+   ### Match Masculin (`2022_BCN_FinalM_1.mp4`)
+   - **Replay détecté**: frames 325-389 (65 frames de changement de caméra)
+   - **Annotations limitées**: seulement jusqu'à `image_id = 21408` (~12 min sur 30 min de vidéo)
+   - Au-delà de 21408, il n'y a plus d'annotations → heatmaps vides même si la balle est visible
+
+   ### Match Féminin (`2022_BCN_FinalF_1.mp4`)
+   - Pas de replays détectés, annotations synchronisées
+   - On s'arrête à `image_id = 45000` par précaution (dernières ~900 frames non vérifiées)
+
+   ### Solution implémentée
+
+   Le script `convert_padeltracker.py` gère automatiquement ces problèmes via `VIDEO_SYNC_CONFIG`:
+   ```python
+   VIDEO_SYNC_CONFIG = {
+       '2022_BCN_FinalF_1': {
+           'replays': [],
+           'max_annotation_id': 45000,
+       },
+       '2022_BCN_FinalM_1': {
+           'replays': [{'start': 325, 'end': 389}],  # Skip ces frames
+           'max_annotation_id': 21408,  # Arrêter ici
+       },
+   }
+   ```
+
+   Le script:
+   1. **Skip** les frames de replay (ne les inclut pas dans le dataset)
+   2. **Applique un offset** pour mapper correctement frame_video → image_id
+   3. **S'arrête** quand il n'y a plus d'annotations
+
+   ### Frames utilisables finales
+   - Féminin: ~45000 frames
+   - Masculin: ~21343 frames (21408 - 65 frames de replay)
+   - **Total: ~66343 frames** (au lieu de ~100k annoncés dans le dataset)
+
 ---
 
 *Résumé généré le 20 décembre 2025*

@@ -31,6 +31,21 @@ from tqdm import tqdm
 TARGET_WIDTH = 512
 TARGET_HEIGHT = 288
 
+# Video-specific sync corrections for PadelTracker100
+# The masculine match (FinalM) has replays that are not in the annotations
+VIDEO_SYNC_CONFIG = {
+    '2022_BCN_FinalF_1': {
+        'replays': [],  # No replays in feminine match
+        'max_annotation_id': 45000,  # Stop at 45000 to be safe (last ~900 frames may have issues)
+    },
+    '2022_BCN_FinalM_1': {
+        'replays': [
+            {'start': 325, 'end': 389},  # 65 frames of replay
+        ],
+        'max_annotation_id': 21408,  # Stop at this annotation (only ~40% of video is annotated)
+    },
+}
+
 
 def load_config(config_path: str) -> dict:
     """Load preprocessing config from YAML file."""
@@ -154,6 +169,28 @@ def extract_frames_from_video(video_path: str, output_dir: Path, max_frames: int
     return frame_count
 
 
+def get_sync_config(video_stem: str) -> dict:
+    """Get sync configuration for a video."""
+    return VIDEO_SYNC_CONFIG.get(video_stem, {'replays': [], 'max_annotation_id': None})
+
+
+def is_in_replay(frame_idx: int, replays: list) -> bool:
+    """Check if frame is within a replay segment."""
+    for replay in replays:
+        if replay['start'] <= frame_idx <= replay['end']:
+            return True
+    return False
+
+
+def get_cumulative_offset(frame_idx: int, replays: list) -> int:
+    """Calculate cumulative offset from all replays before this frame."""
+    offset = 0
+    for replay in replays:
+        if frame_idx > replay['end']:
+            offset += replay['end'] - replay['start'] + 1
+    return offset
+
+
 def process_match(
     video_path: str,
     annotations_path: str,
@@ -186,7 +223,12 @@ def process_match(
     print(f"\nLoading annotations from {annotations_path}...")
     images_dict, annotations_dict = load_coco_annotations(annotations_path)
 
-    # Get video info
+    # Get video info and sync config
+    video_stem = Path(video_path).stem
+    sync_config = get_sync_config(video_stem)
+    replays = sync_config['replays']
+    max_annotation_id = sync_config['max_annotation_id']
+
     cap = cv2.VideoCapture(video_path)
     orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -196,6 +238,12 @@ def process_match(
 
     print(f"Video: {orig_width}x{orig_height}, {total_frames} frames, {fps:.2f} FPS")
     print(f"Annotations: {len(images_dict)} images, {len(annotations_dict)} ball positions")
+
+    if replays:
+        total_replay_frames = sum(r['end'] - r['start'] + 1 for r in replays)
+        print(f"Sync config: {len(replays)} replay(s) ({total_replay_frames} frames to skip)")
+    if max_annotation_id:
+        print(f"Max annotation ID: {max_annotation_id}")
 
     if max_frames:
         total_frames = min(total_frames, max_frames)
@@ -210,11 +258,13 @@ def process_match(
     stats = {
         'total_frames': 0,
         'frames_with_ball': 0,
-        'frames_without_ball': 0
+        'frames_without_ball': 0,
+        'frames_skipped_replay': 0
     }
 
     pbar = tqdm(total=total_frames, desc=f"Processing {match_name}")
     frame_idx = 0
+    output_idx = 0  # Separate counter for output frames (excludes replays)
 
     while True:
         ret, frame = cap.read()
@@ -224,10 +274,26 @@ def process_match(
         if max_frames and frame_idx >= max_frames:
             break
 
-        # Determine frame group
-        group_idx = frame_idx // frames_per_group
+        # Skip replay frames
+        if is_in_replay(frame_idx, replays):
+            stats['frames_skipped_replay'] += 1
+            frame_idx += 1
+            pbar.update(1)
+            continue
+
+        # Calculate image_id with offset correction
+        offset = get_cumulative_offset(frame_idx, replays)
+        image_id = frame_idx - offset + 1
+
+        # Stop if we've reached the max annotation ID
+        if max_annotation_id and image_id > max_annotation_id:
+            print(f"\nReached max annotation ID {max_annotation_id}, stopping.")
+            break
+
+        # Determine frame group (based on output_idx, not frame_idx)
+        group_idx = output_idx // frames_per_group
         group_name = f"frame{group_idx}"
-        local_idx = frame_idx % frames_per_group
+        local_idx = output_idx % frames_per_group
 
         # Create directories
         input_group_dir = inputs_dir / group_name
@@ -241,9 +307,6 @@ def process_match(
         cv2.imwrite(str(input_path), frame_resized)
 
         # Generate heatmap
-        # Image IDs in COCO are 1-indexed, frame_idx is 0-indexed
-        image_id = frame_idx + 1
-
         if image_id in annotations_dict:
             ann = annotations_dict[image_id]
             # Calculate ball center in original coords
@@ -268,6 +331,7 @@ def process_match(
 
         stats['total_frames'] += 1
         frame_idx += 1
+        output_idx += 1
         pbar.update(1)
 
     pbar.close()
@@ -379,6 +443,8 @@ def main():
         print(f"  Total frames: {stats['total_frames']}")
         print(f"  With ball: {stats['frames_with_ball']} ({100*stats['frames_with_ball']/stats['total_frames']:.1f}%)")
         print(f"  Without ball: {stats['frames_without_ball']} ({100*stats['frames_without_ball']/stats['total_frames']:.1f}%)")
+        if stats.get('frames_skipped_replay', 0) > 0:
+            print(f"  Skipped (replay): {stats['frames_skipped_replay']}")
 
     # Final summary
     print(f"\n{'='*60}")

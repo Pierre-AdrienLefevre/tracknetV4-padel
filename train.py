@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+import cv2
 import numpy as np
 
 from model.loss import WeightedBinaryCrossEntropy
@@ -105,15 +106,18 @@ class Trainer:
             self.step = self.checkpoint.get('step', 0)
             self.best_loss = self.checkpoint.get('best_loss', self.checkpoint.get('val_loss', float('inf')))
             if self.is_main:
-                # Resume W&B run with saved run_id if available
+                # Resume W&B run - use group to keep all runs together
                 wandb_run_id = self.checkpoint.get('wandb_run_id')
+                # Use experiment name as group to keep all resumes together
+                group_name = self.save_dir.name
                 wandb.init(
                     project=self.cfg.get('wandb_project', 'tracknet'),
                     entity=self.cfg.get('wandb_entity'),
-                    name=self.save_dir.name,
+                    name=f"{group_name}_resume_{self.start_epoch}",
+                    group=group_name,
                     config=self.cfg,
                     id=wandb_run_id,
-                    resume='must' if wandb_run_id else 'allow',
+                    resume='allow',
                     dir=str(self.save_dir)
                 )
                 print(f"Resuming from epoch {self.start_epoch}, step {self.step}")
@@ -123,10 +127,13 @@ class Trainer:
             if self.is_main:
                 self.save_dir.mkdir(parents=True, exist_ok=True)
                 (self.save_dir / "checkpoints").mkdir(exist_ok=True)
+                # Use experiment name as group for potential future resumes
+                group_name = self.save_dir.name
                 wandb.init(
                     project=self.cfg.get('wandb_project', 'tracknet'),
                     entity=self.cfg.get('wandb_entity'),
-                    name=self.save_dir.name,
+                    name=group_name,
+                    group=group_name,
                     config=self.cfg,
                     dir=str(self.save_dir)
                 )
@@ -389,20 +396,26 @@ class Trainer:
         caption = f"Epoch {epoch+1}" if epoch is not None else "Validation"
         wandb.log({f"predictions/{caption}": images}, step=self.step)
 
-    def _create_overlay(self, frame, heatmap, color=(255, 0, 0), alpha=0.5):
-        """Create overlay of heatmap on frame."""
-        overlay = frame.copy()
-        heatmap_normalized = (heatmap * 255).astype(np.uint8)
+    def _create_overlay(self, frame, heatmap, color=(255, 0, 0)):
+        """Create overlay with circle at detected ball position."""
+        # Convert RGB to BGR for OpenCV
+        overlay = cv2.cvtColor(frame.copy(), cv2.COLOR_RGB2BGR)
 
-        # Create colored heatmap
-        colored_heatmap = np.zeros_like(overlay)
-        for i, c in enumerate(color):
-            colored_heatmap[:, :, i] = (heatmap_normalized * c / 255).astype(np.uint8)
+        max_val = heatmap.max()
+        if max_val > 0.1:  # Ball detected
+            y, x = np.unravel_index(heatmap.argmax(), heatmap.shape)
+            # Convert color from RGB to BGR for OpenCV
+            bgr_color = (color[2], color[1], color[0])
+            # Draw circle
+            cv2.circle(overlay, (x, y), 12, bgr_color, 2)
+            cv2.circle(overlay, (x, y), 2, bgr_color, -1)  # Center point
+            # Add confidence text
+            conf = int(max_val * 100)
+            cv2.putText(overlay, f"{conf}%", (x + 15, y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr_color, 1)
 
-        # Blend
-        mask = heatmap > 0.1
-        overlay[mask] = (overlay[mask] * (1 - alpha) + colored_heatmap[mask] * alpha).astype(np.uint8)
-        return overlay
+        # Convert back to RGB for wandb
+        return cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
 
     def train(self):
         self.setup_data()

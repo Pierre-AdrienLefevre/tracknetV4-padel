@@ -191,10 +191,7 @@ uv run python preprocessing/convert_padeltracker.py \
   --force
 
 # Conversion complète (~100k frames, ~20-30 min)
-uv run python preprocessing/convert_padeltracker.py \
-  --source dataset \
-  --output dataset/preprocessed/train \
-  --force
+uv run python preprocessing/convert_padeltracker.py --source dataset --output dataset/preprocessed/train --force
 ```
 
 **Options disponibles**:
@@ -214,10 +211,7 @@ uv run python train.py --config config.yaml
 ### Étape 6: Inférence
 ```bash
 # Sur une vidéo
-uv run python predict/streem_video_predict.py \
-  --model outputs/exp_*/checkpoints/best_model.pth \
-  --input ma_video.mp4 \
-  --output predictions/
+uv run python predict/streem_video_predict.py --model outputs/exp_*/checkpoints/best_model.pth \ --input dataset/2022_BCN_FinalF_1_sample.mp4 \ --output predictions/
 ```
 
 ---

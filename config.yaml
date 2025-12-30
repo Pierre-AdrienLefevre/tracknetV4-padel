@@ -27,7 +27,7 @@ train:
   resume: null  # Chemin pour reprendre l'entrainement (ex: outputs/exp_20241219_140000)
   split: 0.8  # Ratio train/validation
   seed: 24  # Graine aleatoire
-  batch: 8  # Taille du batch
+  batch: 16 # Taille du batch
   epochs: 30  # Nombre d'epoques
   workers: 4  # Nombre de workers pour le DataLoader
   device: auto  # Device: auto/cpu/cuda/mps
